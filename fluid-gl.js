@@ -129,9 +129,9 @@ export class FluidGL {
 
         this.jitterBuf = makeBuffer(gl, gl.ARRAY_BUFFER, this.jitter, gl.STATIC_DRAW);
 
-        // P2G 散布のインスタンス描画で使う 0..26 の近傍番号 (ATTR.ineighbor のコメント参照)。
-        this.neighborBuf = makeBuffer(
-            gl, gl.ARRAY_BUFFER, Float32Array.from({ length: 27 }, (_, i) => i), gl.STATIC_DRAW);
+        // P2G 散布のインスタンス描画で使うZスライス番号 0,1,2 (ATTR.islice のコメント参照)。
+        this.sliceBuf = makeBuffer(
+            gl, gl.ARRAY_BUFFER, Float32Array.from({ length: 3 }, (_, i) => i), gl.STATIC_DRAW);
 
         // ── グリッドテクスチャ ──
         // massTex (R32F)  : P2G 質量散布の加算ブレンド先
@@ -168,8 +168,8 @@ export class FluidGL {
         const tf = { tfVaryings: TF_VARYINGS };
         this.progPressure = makeProgram(gl, src.PRESSURE_VS, NOOP_FS, { ...tf, label: 'pressure (TF)' });
         this.progG2P      = makeProgram(gl, src.G2P_VS, NOOP_FS,      { ...tf, label: 'g2p (TF)' });
-        this.progP2GMass  = makeProgram(gl, src.P2G_MASS_VS, src.SPLAT_FS, { label: 'p2g mass' });
-        this.progP2GMom   = makeProgram(gl, src.P2G_MOM_VS, src.SPLAT_FS,  { label: 'p2g momentum' });
+        this.progP2GMass  = makeProgram(gl, src.P2G_MASS_VS, src.P2G_MASS_FS, { label: 'p2g mass' });
+        this.progP2GMom   = makeProgram(gl, src.P2G_MOM_VS, src.P2G_MOM_FS,   { label: 'p2g momentum' });
         this.progGridUpd  = makeProgram(gl, src.FULLSCREEN_VS, src.GRID_UPDATE_FS, { label: 'grid update' });
 
         this.uPressure = uniformLocations(gl, this.progPressure);
@@ -241,8 +241,8 @@ export class FluidGL {
             idensity: { loc: ATTR.idensity, size: 1, offset: OFF.density * 4 },
         };
         const external = {
-            ijitter:   { loc: ATTR.ijitter,   size: 3, buffer: this.jitterBuf,   stride: 12 },
-            ineighbor: { loc: ATTR.ineighbor, size: 1, buffer: this.neighborBuf, stride: 4 },
+            ijitter: { loc: ATTR.ijitter, size: 3, buffer: this.jitterBuf, stride: 12 },
+            islice:  { loc: ATTR.islice,  size: 1, buffer: this.sliceBuf,  stride: 4 },
         };
         return makeVAO(this.gl, names.map((n) => {
             if (inState[n]) return { ...inState[n], buffer: buf, stride: st, divisor };
@@ -282,13 +282,15 @@ export class FluidGL {
         this.cur = 1 - this.cur;
     }
 
-    // 1粒子あたり 27 点 (3×3×3 近傍) を加算ブレンドで散布する = P2G。
-    // WebGL2 には atomic が無いのでこれが唯一の手段。
+    // 1粒子あたり 3 点 (Zスライスごとに1点、各点が3×3=9セル分をgl_PointSize=3.0の
+    // 点でまとめてカバー) を加算ブレンドで散布する = P2G。WebGL2 には atomic が無いので
+    // これが唯一の手段 (2026-07-31、27点/粒子から1/9のドロー数に最適化。詳細は
+    // gl-shaders.js P2G_MASS_VS のコメント参照)。
     _runSplat(prog, vaos, count) {
         const gl = this.gl;
         gl.useProgram(prog);
         gl.bindVertexArray(vaos[this.cur]);
-        gl.drawArraysInstanced(gl.POINTS, 0, 27, count);
+        gl.drawArraysInstanced(gl.POINTS, 0, 3, count);
         gl.bindVertexArray(null);
     }
 

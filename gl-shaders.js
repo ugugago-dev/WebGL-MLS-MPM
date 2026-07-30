@@ -31,10 +31,12 @@ export const ATTR = {
     iC0: 3, iC1: 4, iC2: 5,
     idensity: 6,
     ijitter: 7,
-    // 3×3×3 近傍のどれを担当するかを示す 0..26 の番号。gl_VertexID でも同じ値は得られるが、
-    // WebGL2 のインスタンス描画は「divisor が 0 の有効な属性が最低1つ」必要で、粒子属性を
-    // 全部 divisor=1 にすると INVALID_OPERATION になる。この属性が divisor=0 側を兼ねる。
-    ineighbor: 8,
+    // 3×3×3近傍のうちどのZスライス(0..2)を担当するかを示す番号 (2026-07-31、27点→
+    // 3点散布への最適化で「近傍27個のどれか」から意味が変わった)。gl_VertexID でも
+    // 同じ値は得られるが、WebGL2 のインスタンス描画は「divisor が 0 の有効な属性が
+    // 最低1つ」必要で、粒子属性を全部 divisor=1 にすると INVALID_OPERATION になる。
+    // この属性が divisor=0 側を兼ねる。
+    islice: 8,
 };
 
 // ── プログラムごとの入力属性 (単一の宣言) ──
@@ -51,7 +53,7 @@ const DECL = {
     iC2:       `layout(location = ${ATTR.iC2})       in vec3  iC2;`,
     idensity:  `layout(location = ${ATTR.idensity})  in float idensity;`,
     ijitter:   `layout(location = ${ATTR.ijitter})   in vec3  ijitter;`,
-    ineighbor: `layout(location = ${ATTR.ineighbor}) in float ineighbor;`,
+    islice:    `layout(location = ${ATTR.islice})    in float islice;`,
 };
 
 // 状態を丸ごと読む TF パス用 (copyAll() が全 varying を埋めるので全属性が要る)。
@@ -59,9 +61,9 @@ const STATE_NAMES = ['ipos', 'ivel', 'imass', 'iC0', 'iC1', 'iC2', 'idensity'];
 
 export const PROGRAM_ATTRIBS = {
     // 質量散布は pos と mass しか使わない。重みは pos から導出する。
-    p2gMass:  ['ipos', 'imass', 'ineighbor'],
+    p2gMass:  ['ipos', 'imass', 'islice'],
     // 運動量散布は M (=C0..C2) と vel/mass、それに density (棄却判定) を使う。
-    p2gMom:   ['ipos', 'ivel', 'imass', 'iC0', 'iC1', 'iC2', 'idensity', 'ineighbor'],
+    p2gMom:   ['ipos', 'ivel', 'imass', 'iC0', 'iC1', 'iC2', 'idensity', 'islice'],
     pressure: STATE_NAMES,
     g2p:      [...STATE_NAMES, 'ijitter'],
 };
@@ -135,16 +137,11 @@ void cellAndWeights(vec3 p, out ivec3 cellI, out vec3 f, out vec3 wx, out vec3 w
 }
 `;
 
-    // 3×3×3 近傍の 27 頂点インスタンス描画で使う共通部分。
+    // P2G 散布 (頂点シェーダ側のみで使う共通部分)。
     const SPLAT_COMMON = `
 // 範囲外セルへ散布しようとした点をクリップ空間の外へ飛ばして捨てる
 // (discard より安く、ラスタライズ自体が起きない)。
 const vec4 CULLED = vec4(-2.0, -2.0, -2.0, 1.0);
-
-ivec3 neighborIJK() {
-    int v = int(ineighbor);
-    return ivec3(v % 3, (v / 3) % 3, v / 9);
-}
 
 // セル座標 → クリップ空間。1 セル = 1 texel なので点の大きさは常に 1。
 vec4 cellClipPos(ivec3 c) {
@@ -154,7 +151,13 @@ vec4 cellClipPos(ivec3 c) {
 `;
 
     // ── パス1: P2G 質量散布 ── WGSL_P2G_MASS 相当。
-    // atomicAdd の代わりに「1粒子あたり 27 点を描いて加算ブレンド」で散布する。
+    // atomicAdd の代わりに加算ブレンドで散布する。2026-07-31 に 27頂点/粒子 → 3頂点/粒子へ
+    // 最適化済み: テクスチャ配置が texel=(cx, cz*gridY+cy) なので、Zスライスを固定すれば
+    // (dx,dy) の3×3近傍がテクセル空間でちょうど連続した3×3ブロックになる。そこで
+    // gl_PointSize=3.0 の点1個でその9セルをまとめてラスタライズし (ALIASED_POINT_SIZE_RANGE
+    // が3以上あるモバイル含む全対象環境で前提、WebGL2の点は非AAなので3×3が正確に埋まる)、
+    // フラグメント側で gl_FragCoord から実際のテクセル位置を復元して重みを掛け直す。
+    // ドロー回数は1/9、ブレンド書き込み回数(=P2Gの実コスト)自体は変わらない。
     // 出力先は R32F の質量専用テクスチャ (RGBA32F だとブレンドの read-modify-write が
     // 1 フラグメント 32B になるが、R32F なら 8B で済む)。
     const P2G_MASS_VS = `#version 300 es
@@ -163,27 +166,57 @@ ${COMMON}
 ${declare(PROGRAM_ATTRIBS.p2gMass)}
 ${SPLAT_COMMON}
 
-out vec4 vContrib;
+flat out ivec3 vBaseCell; // このインスタンスの3×3ブロックの基準セル (cellI-1, cellI-1, cz)
+flat out int   vDz;       // wz[] を引くための相対z (0..2)
+flat out vec3  vF;        // FSでquadraticWeights()を呼び直すための端数位置
+flat out float vImass;
 
 void main() {
-    ivec3 ijk = neighborIJK();
+    int dz = int(islice); // 0, 1, 2 (Zスライスごとに1点、3インスタンス分)
     ivec3 cellI; vec3 f, wx, wy, wz;
     cellAndWeights(ipos, cellI, f, wx, wy, wz);
-    ivec3 c = cellI - 1 + ijk;
-    if (!inGrid(c)) { gl_Position = CULLED; gl_PointSize = 1.0; vContrib = vec4(0.0); return; }
+    int cz = cellI.z - 1 + dz;
+    if (cz < 0 || cz >= GRID.z) {
+        gl_Position = CULLED; gl_PointSize = 1.0;
+        vBaseCell = ivec3(0); vDz = 0; vF = vec3(0.0); vImass = 0.0;
+        return;
+    }
 
-    float w = wx[ijk.x] * wy[ijk.y] * wz[ijk.z];
-    vContrib = vec4(w * imass, 0.0, 0.0, 0.0);   // R32F なので .r だけが書かれる
-    gl_Position  = cellClipPos(c);
-    gl_PointSize = 1.0;
+    vBaseCell = ivec3(cellI.x - 1, cellI.y - 1, cz);
+    vDz = dz;
+    vF = f;
+    vImass = imass;
+    gl_Position  = cellClipPos(ivec3(cellI.x, cellI.y, cz)); // 3×3ブロックの中心セル
+    gl_PointSize = 3.0;
 }
 `;
 
-    const SPLAT_FS = `#version 300 es
+    // FSはCOMMON(GRID/inGrid/quadraticWeights)だけで足りる — CULLED/cellClipPosはVS専用。
+    const P2G_MASS_FS = `#version 300 es
 precision highp float;
-in vec4 vContrib;
+${COMMON}
+flat in ivec3 vBaseCell;
+flat in int   vDz;
+flat in vec3  vF;
+flat in float vImass;
 layout(location = 0) out vec4 oColor;
-void main() { oColor = vContrib; }
+
+void main() {
+    ivec2 t = ivec2(gl_FragCoord.xy);
+    int dx = t.x - vBaseCell.x;
+    int dy = t.y - (vBaseCell.z * GRID.y + vBaseCell.y);
+    // 点の中心がグリッド端付近だと3×3の一部がこの粒子の担当セル外になり得る
+    // (HARD_MINにより通常は起きないが、初期スポーン直後などクランプ前の位置では
+    // 起こり得るので、頂点単位のカリングに加えてフラグメント単位でも弾く)。
+    if (dx < 0 || dx > 2 || dy < 0 || dy > 2) discard;
+    ivec3 c = ivec3(vBaseCell.x + dx, vBaseCell.y + dy, vBaseCell.z);
+    if (!inGrid(c)) discard;
+
+    vec3 wx, wy, wz;
+    quadraticWeights(vF, wx, wy, wz);
+    float w = wx[dx] * wy[dy] * wz[vDz];
+    oColor = vec4(w * vImass, 0.0, 0.0, 0.0); // R32F なので .r だけが書かれる
+}
 `;
 
     // ── パス2: 密度・圧力 (TF) ── WGSL_P2G_MOM の前半。
@@ -256,33 +289,71 @@ void main() {
 }
 `;
 
-    // ── パス3: P2G 運動量散布 ── WGSL_P2G_MOM の後半。
+    // ── パス3: P2G 運動量散布 ── WGSL_P2G_MOM の後半。質量散布と同じ27→3頂点/粒子の
+    // 最適化を適用 (詳細はP2G_MASS_VSのコメント参照)。d(=セル中心相対位置)のうちZ成分は
+    // インスタンスごとに固定なので、FSで復元するdx/dyだけからd全体を組み直す。
     const P2G_MOM_VS = `#version 300 es
 precision highp float;
 ${COMMON}
 ${declare(PROGRAM_ATTRIBS.p2gMom)}
 ${SPLAT_COMMON}
 
-out vec4 vContrib;
+flat out ivec3 vBaseCell;
+flat out int   vDz;
+flat out vec3  vF;
+flat out vec3  vMassVel; // imass*ivel
+flat out vec3  vC0, vC1, vC2;
 
 void main() {
     // 密度がほぼ 0 の粒子は運動量を散布しない (WGSL 版が early return する条件と同じ)。
-    ivec3 ijk = neighborIJK();
+    int dz = int(islice);
     ivec3 cellI; vec3 f, wx, wy, wz;
     cellAndWeights(ipos, cellI, f, wx, wy, wz);
-    ivec3 c = cellI - 1 + ijk;
-    if (!inGrid(c) || idensity <= 1e-8) { gl_Position = CULLED; gl_PointSize = 1.0; vContrib = vec4(0.0); return; }
+    int cz = cellI.z - 1 + dz;
+    if (cz < 0 || cz >= GRID.z || idensity <= 1e-8) {
+        gl_Position = CULLED; gl_PointSize = 1.0;
+        vBaseCell = ivec3(0); vDz = 0; vF = vec3(0.0);
+        vMassVel = vec3(0.0); vC0 = vec3(0.0); vC1 = vec3(0.0); vC2 = vec3(0.0);
+        return;
+    }
 
-    vec3 d = vec3(ijk) - 1.0 - f;
-    float w = wx[ijk.x] * wy[ijk.y] * wz[ijk.z];
+    vBaseCell = ivec3(cellI.x - 1, cellI.y - 1, cz);
+    vDz = dz;
+    vF = f;
+    vMassVel = imass * ivel;
+    vC0 = iC0; vC1 = iC1; vC2 = iC2;
+    gl_Position  = cellClipPos(ivec3(cellI.x, cellI.y, cz));
+    gl_PointSize = 3.0;
+}
+`;
+
+    const P2G_MOM_FS = `#version 300 es
+precision highp float;
+${COMMON}
+flat in ivec3 vBaseCell;
+flat in int   vDz;
+flat in vec3  vF;
+flat in vec3  vMassVel;
+flat in vec3  vC0, vC1, vC2;
+layout(location = 0) out vec4 oColor;
+
+void main() {
+    ivec2 t = ivec2(gl_FragCoord.xy);
+    int dx = t.x - vBaseCell.x;
+    int dy = t.y - (vBaseCell.z * GRID.y + vBaseCell.y);
+    if (dx < 0 || dx > 2 || dy < 0 || dy > 2) discard;
+    ivec3 c = ivec3(vBaseCell.x + dx, vBaseCell.y + dy, vBaseCell.z);
+    if (!inGrid(c)) discard;
+
+    vec3 wx, wy, wz;
+    quadraticWeights(vF, wx, wy, wz);
+    float w = wx[dx] * wy[dy] * wz[vDz];
 
     // M は行優先で C0/C1/C2 に入っている (PRESSURE_VS 参照)。mat3() は列優先で
     // 組むので、取り違えないよう dot で明示的に行×ベクトルにする。
-    vec3 md = vec3(dot(iC0, d), dot(iC1, d), dot(iC2, d));
-    vContrib = vec4(w * (imass * ivel + md), 0.0);
-
-    gl_Position  = cellClipPos(c);
-    gl_PointSize = 1.0;
+    vec3 d = vec3(float(dx) - 1.0 - vF.x, float(dy) - 1.0 - vF.y, float(vDz) - 1.0 - vF.z);
+    vec3 md = vec3(dot(vC0, d), dot(vC1, d), dot(vC2, d));
+    oColor = vec4(w * (vMassVel + md), 0.0);
 }
 `;
 
@@ -442,7 +513,7 @@ void main() {
 
     return {
         FULLSCREEN_VS,
-        P2G_MASS_VS, P2G_MOM_VS, SPLAT_FS,
+        P2G_MASS_VS, P2G_MASS_FS, P2G_MOM_VS, P2G_MOM_FS,
         PRESSURE_VS,
         GRID_UPDATE_FS,
         G2P_VS,

@@ -64,7 +64,7 @@ export { BG_DEPTH };
 // (Pass1深度・厚み蓄積で共有)。WebGPU版 particleShader の vs() を GLSL に移植したもの —
 // gl_VertexID による頂点生成ではなく、3頂点分のコーナーを静的VBO (aCorner, divisor=0)
 // として渡す。WebGL2 の「インスタンス描画には divisor=0 の属性が最低1つ必要」という
-// 制約 (CLAUDE.md 踏んだ落とし穴参照) を、P2G散布の ineighbor と同じ要領で満たす。
+// 制約 (CLAUDE.md 踏んだ落とし穴参照) を、P2G散布の islice と同じ要領で満たす。
 function billboardVS(hardMin) {
     return `#version 300 es
 precision highp float;

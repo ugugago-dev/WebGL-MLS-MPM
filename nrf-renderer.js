@@ -76,7 +76,7 @@ export class NRFRenderer {
 
         // 3頂点の外接三角形コーナー (WebGPU版 particleShader.vs と同じ形)。divisor=0固定の
         // 静的VBO — WebGL2の「インスタンス描画にはdivisor=0の属性が最低1つ必要」という
-        // 制約 (P2G散布の ineighbor と同じ役目) をこれで満たす。
+        // 制約 (P2G散布の islice と同じ役目) をこれで満たす。
         this.cornerBuf = makeBuffer(
             gl, gl.ARRAY_BUFFER,
             new Float32Array([0, 2, -1.7320508, -1, 1.7320508, -1]),
