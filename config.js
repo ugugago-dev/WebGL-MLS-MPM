@@ -11,7 +11,7 @@ export const dpr = isMobile ? 1 : Math.min(window.devicePixelRatio || 1, 2);
 // desktop 0.015 → 34×34×50 = 57,800 セル (WebGPU 版 desktop は 0.0125 で 40×40×60 = 96,000)。
 export const PARTICLE_RADIUS = isMobile ? 0.02 : 0.0175;
 
-export const PARTICLE_COUNT = isMobile ? 60000 : 100000;
+export const PARTICLE_COUNT = isMobile ? 20000 : 100000;
 
 // ─────────────────────────────────────────────────────────────
 //  Diagnostic URL overrides (?p=50000 など)。実機の負荷切り分け用で、
