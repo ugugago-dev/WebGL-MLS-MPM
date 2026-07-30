@@ -9,7 +9,7 @@
 // (WebGPU版が REST_DENSITY 等をテンプレートリテラルで焼き込むのと同じ流儀)。
 
 import { FULLSCREEN_VS } from './gl-shaders.js';
-import { urlNum, isMobile } from './config.js';
+import { urlNum } from './config.js';
 
 // GLSL ES 300 は int↔float の暗黙変換を一切許さないため、JSの数値をテンプレート
 // リテラルでGLSLソースへ焼き込むときは整数値でも必ず小数点を付けて float リテラル
@@ -33,10 +33,10 @@ export const NRF_ITERATIONS = urlNum('nrf', 2);
 // 持つが、Sim_WebGLはshadeがdepth/thicknessをtexelFetchで直接読む構造 (アップサンプル
 // 無し) なので、両方を1つの解像度に統一したほうがシンプル — shadeまでの全パスが
 // 同じ解像度なら、shade内で追加のバイリニアアップサンプルを実装する必要が無い。
-// ?rs= で診断用に上書き可能 (WebGPU版の同名ノブと同じ流儀)。モバイルは既定値そのままだと
-// 実機のGPU性能不足でfpsが出ないので、config.js PARTICLE_RADIUS/COUNTと同じ理由で
-// デフォルトだけ下げる (?rs指定があれば常にそちらが勝つ)。
-export const RENDER_SCALE = urlNum('rs', isMobile ? 0.35 : 0.5);
+// ?rs= で診断用に上書き可能 (WebGPU版の同名ノブと同じ流儀)。デスクトップ・モバイル
+// 共通で0.5 (2026-07-31、P2G散布の27→3頂点最適化でモバイル既定を0.35へ下げていたが、
+// ユーザー確認により0.5に戻した)。
+export const RENDER_SCALE = urlNum('rs', 0.5);
 
 const THICK_SMOOTH_SIGMA  = 3.0;
 const THICK_SMOOTH_RADIUS = Math.ceil(2 * THICK_SMOOTH_SIGMA);

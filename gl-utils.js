@@ -30,6 +30,20 @@ export function getGL2(canvas, opts = {}) {
             `浮動小数点テクスチャへの加算ブレンドが使えないため、P2G (粒子→グリッドの散布) が実装できません。`
         );
     }
+
+    // P2G散布 (gl-shaders.js P2G_MASS_VS/P2G_MOM_VS) はgl_PointSize=3.0の点1個で3×3セルを
+    // まとめてラスタライズする前提 (2026-07-31、27点→3点/粒子の最適化)。ここが未対応だと
+    // 点が黙って縮小され、P2Gが質量保存を静かに崩す (エラーは出ない) ので拡張チェックと
+    // 同じ扱いで起動時に落とす。
+    const maxPointSize = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1];
+    if (maxPointSize < 3) {
+        throw new GLCapabilityError(
+            `ALIASED_POINT_SIZE_RANGE の上限が ${maxPointSize} で 3 未満です。\n` +
+            `P2G散布が gl_PointSize=3.0 の点で3×3セルをまとめてラスタライズする前提のため、` +
+            `点の大きさが足りないと物理が壊れます。`
+        );
+    }
+
     return gl;
 }
 

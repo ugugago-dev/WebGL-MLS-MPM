@@ -86,11 +86,19 @@ export class FluidGL {
 
     // x0..z1: 各軸 0–1 の正規化座標。粒子は 0.5 セル間隔で配置する。
     // 複数回呼ぶと現在の active_particle_num から積み上がる。
+    //
+    // 各軸 [HARD_MIN, dim-HARD_MIN] にクランプする: G2P の hardClampAxis は毎substep
+    // この範囲を保証するが、initGL直後の最初のP2G (=1回目のG2Pがまだ走っていない) は
+    // fillBlock が置いた生の位置をそのまま読む。呼び出し側の正規化座標(spacing=0.03等)が
+    // 小さいグリッドではHARD_MIN=2セルを下回り得る (例: 34セル×0.03≈1.02<2) ので、
+    // ここでクランプしないとP2G散布のステンシルがグリッド外に出る一時的な状態が生まれる
+    // (P2G_MASS_FS/P2G_MOM_FSのdiscardが安全網として拾うが、そもそも起こさないほうがよい)。
     fillBlock(x0, y0, z0, x1, y1, z1) {
         const step = 0.5, jitter = 0.05;
-        const gx0 = x0 * this.grid_X_num, gx1 = x1 * this.grid_X_num;
-        const gy0 = y0 * this.grid_Y_num, gy1 = y1 * this.grid_Y_num;
-        const gz0 = z0 * this.grid_Z_num, gz1 = z1 * this.grid_Z_num;
+        const HM = this.HARD_MIN;
+        const gx0 = Math.max(HM, x0 * this.grid_X_num), gx1 = Math.min(this.grid_X_num - HM, x1 * this.grid_X_num);
+        const gy0 = Math.max(HM, y0 * this.grid_Y_num), gy1 = Math.min(this.grid_Y_num - HM, y1 * this.grid_Y_num);
+        const gz0 = Math.max(HM, z0 * this.grid_Z_num), gz1 = Math.min(this.grid_Z_num - HM, z1 * this.grid_Z_num);
         const s = this.state;
         let p = this.active_particle_num;
         outer:
