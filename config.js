@@ -9,7 +9,7 @@ export const dpr = isMobile ? 1 : Math.min(window.devicePixelRatio || 1, 2);
 // グリッドの粒子半径パラメータ。FluidGL のコンストラクタが 1/(radius*4) をセル数の
 // スケールに使うので、値を上げるほどグリッドが粗くなる。
 // desktop 0.015 → 34×34×50 = 57,800 セル (WebGPU 版 desktop は 0.0125 で 40×40×60 = 96,000)。
-export const PARTICLE_RADIUS = isMobile ? 0.02 : 0.0175;
+export const PARTICLE_RADIUS = isMobile ? 0.0275 : 0.0175;
 
 export const PARTICLE_COUNT = isMobile ? 20000 : 100000;
 
