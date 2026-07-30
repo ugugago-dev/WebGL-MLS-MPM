@@ -264,13 +264,13 @@ void main() {
 }
 
 // shade: 深度→法線再構成 + Schlick Fresnel + Beer-Lambert。WebGPU版 (../fluid-renderer.js
-// shade パス) と厳密に同じ式・同じ定数値で移植する。WebGPU版自体、反射は方向計算をしない
-// 固定 skyColor 一色、屈折は bgColorTex (壁を描いた後の背景レイヤー) をサンプリングして
-// Beer-Lambertで減衰させたもの — Sim_WebGLは壁セルが恒久的に対象外なので、bgColorTexは
-// 常にPass Wの背景クリア色 (0.08,0.08,0.08) のまま (壁が乗ることは無い)。つまり
-// 「どのUVをサンプルしても同じ値」なので、背景レンダーパス・UVオフセット計算・
-// 手前オクルーダガードを新設せず、その定数値をそのまま使う — 結果はレンダーパスを
-// 追加した場合と数学的に同一 (壁が無い限りbgColorTexは一様なので)。
+// shade パス) と大枠は同じだが、背景/反射/屈折は2026-07-30にsuburban_garden_4k.exrから
+// 変換したequirectangularパノラマ(textures/suburban_garden_equirect.png)を使うよう
+// WebGPU版から分岐した — キューブマップやスカイボックスジオメトリは使わず、方向ベクトル
+// →equirect UV変換 (equirectUV()) を背景・反射・屈折の3箇所で使い回すだけ。
+// Sim_WebGLは壁セル/床ジオメトリが恒久的に対象外なので、水が無いピクセルはカメラ視線
+// 方向をそのまま環境マップへ投げて表示する (画面上=空、画面下=地面が写るだけで、
+// 実際の地面ジオメトリとの整合は取れない — 見た目のための近似)。
 //
 // ネイティブ解像度のみ (FLUID_RES_SCALE無し) なので、depth/thicknessはtexelFetchで
 // そのまま読む (バイリニアアップサンプル不要)。9×9インラインクリーンアップ
@@ -282,15 +282,47 @@ const SHADE_FS = `#version 300 es
 precision highp float;
 uniform sampler2D uDepthTex;
 uniform sampler2D uThickTex;
+uniform sampler2D uEnvTex;
 uniform vec2      uScreenRes;
 uniform float     uTanHalfFovY;
 uniform float     uAspect;
+uniform vec3      uCamRight;
+uniform vec3      uCamUp;
+uniform vec3      uCamForward;
 layout(location = 0) out vec4 oColor;
+
+const float PI = 3.14159265359;
+
+// equirectangular環境マップの方向→UV変換。gl-utils.js loadEquirectTexture()が
+// UNPACK_FLIP_Y_WEBGLなし(既定false)でアップロードしているため、v=0がパノラマの
+// 先頭行=上端(+Y、空)、v=1が下端(-Y、地面)になる。
+vec2 equirectUV(vec3 dir) {
+    float u = 0.5 + atan(dir.z, dir.x) / (2.0 * PI);
+    float v = acos(clamp(dir.y, -1.0, 1.0)) / PI;
+    return vec2(u, v);
+}
+
+// view空間の方向ベクトルをworld空間へ回転する。uCamRight/uCamUp/uCamForwardは
+// nrf-renderer.js _setBillboardCamera() がmath.js cameraVectors()の出力(いずれも
+// 正規直交)をそのままアップロードしたもの — フラグメントごとにcross()で作り直さない。
+vec3 viewToWorldDir(vec3 v) {
+    return normalize(uCamRight * v.x + uCamUp * v.y - uCamForward * v.z);
+}
 
 void main() {
     ivec2 coord = ivec2(gl_FragCoord.xy);
     float rawDepth = texelFetch(uDepthTex, coord, 0).r;
-    if (rawDepth < 0.0) discard;
+
+    float ndcX = 2.0 * gl_FragCoord.x / uScreenRes.x - 1.0;
+    float ndcY = 2.0 * gl_FragCoord.y / uScreenRes.y - 1.0;
+    // depth=1のview空間レイ方向。water分岐の pos は depth 倍しただけ (pos = viewRay * depth)。
+    vec3 viewRay = vec3(ndcX * uAspect * uTanHalfFovY, ndcY * uTanHalfFovY, -1.0);
+
+    if (rawDepth < 0.0) {
+        // 水が無いピクセル: カメラ視線方向をそのまま環境マップへ投げて背景として表示。
+        oColor = vec4(texture(uEnvTex, equirectUV(viewToWorldDir(viewRay))).rgb, 1.0);
+        return;
+    }
     float depth = rawDepth;
 
     ivec2 sz = textureSize(uDepthTex, 0);
@@ -317,21 +349,22 @@ void main() {
     float nLen = length(nRaw);
     vec3 n = nLen > 1e-8 ? nRaw / nLen : vec3(0.0, 0.0, 1.0);
 
-    // gl_FragCoord は既に Y-up なので ndcY の符号反転は不要 (WGSL版は Y-down からの
-    // 変換で -(...) していた)。
-    float ndcX = 2.0 * gl_FragCoord.x / uScreenRes.x - 1.0;
-    float ndcY = 2.0 * gl_FragCoord.y / uScreenRes.y - 1.0;
-    vec3 pos = vec3(ndcX * uAspect * uTanHalfFovY * depth, ndcY * uTanHalfFovY * depth, -depth);
+    // viewRayは関数冒頭で計算済み (depth=1のレイ方向)。実位置はdepth倍するだけ。
+    vec3 pos = viewRay * depth;
 
     vec3 viewDir = normalize(-pos);
     float NdotV  = max(dot(n, viewDir), 0.0);
     float fresnel = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0);
 
-    // WebGPU版と同値の固定色。反射は skyColor 一色 (方向計算なし、環境マップ無し)。
-    // 屈折先の bgColorTex は壁が無い限り常にこのクリア色一定なので、その定数を直接使う
-    // (詳細は上のコメント参照)。
-    vec3 skyColor = vec3(0.75, 0.88, 1.0);
-    vec3 bgColor  = vec3(0.08, 0.08, 0.08);
+    // 反射・屈折は同じequirect環境マップを reflect()/refract() の方向でサンプルする
+    // (キューブマップ・スカイボックスジオメトリ無し、方向→UV変換1つを使い回すだけ)。
+    vec3 incident = -viewDir; // カメラ→サーフェスの入射方向 (view空間)
+    vec3 reflectedColor = texture(uEnvTex, equirectUV(viewToWorldDir(reflect(incident, n)))).rgb;
+
+    // 空気(n=1.0)→水(n=1.333)へ入る屈折。eta<1なのでTIRは起こらず常に有効な方向が返る
+    // (GLSL refract()の仕様上、k<0のケースはeta>1=媒質から出る側でしか発生しない)。
+    const float IOR_AIR_OVER_WATER = 1.0 / 1.333;
+    vec3 refractedColor = texture(uEnvTex, equirectUV(viewToWorldDir(refract(incident, n, IOR_AIR_OVER_WATER)))).rgb;
 
     float thickness  = texelFetch(uThickTex, coord, 0).r;
     vec3 absorption  = vec3(${THICKNESS_ABSORPTION.map(glFloat).join(', ')});
@@ -341,11 +374,9 @@ void main() {
     vec3 bodyColor    = mix(shallowWater, deepWater, 1.0 - transmittance.g);
     vec3 scattered    = bodyColor * (1.0 - transmittance.g);
 
-    // refracted = bgColor(定数) * transmittance。WebGPU版の refracted = bgSample*transmittance
-    // と同じ式 (bgSampleがこの環境では常にbgColor定数になる)。
-    vec3 refracted  = bgColor * transmittance;
+    vec3 refracted  = refractedColor * transmittance;
     vec3 transmitted = refracted + scattered;
-    oColor = vec4(mix(transmitted, skyColor, fresnel), 1.0);
+    oColor = vec4(mix(transmitted, reflectedColor, fresnel), 1.0);
 }
 `;
 

@@ -1,7 +1,7 @@
 import { isMobile, dpr, PARTICLE_RADIUS, PARTICLE_COUNT, urlNum, urlFlag } from './config.js';
 import { FluidGL } from './fluid-gl.js';
 import { NRFRenderer } from './nrf-renderer.js';
-import { getGL2, GLCapabilityError } from './gl-utils.js';
+import { getGL2, GLCapabilityError, loadEquirectTexture } from './gl-utils.js';
 import { GLProfiler } from './gl-profiler.js';
 import {
     mat4Perspective, mat4LookAt, mat4Multiply,
@@ -15,7 +15,7 @@ const particleCount = Math.round(urlNum('p', PARTICLE_COUNT));
 
 const fluid = new FluidGL(2, 2, 3, urlNum('r', PARTICLE_RADIUS), particleCount);
 const spacing = 0.03;
-fluid.fillBlock(spacing, spacing, spacing, 1.0 - spacing, 1.0 - spacing, 0.4 - spacing);
+fluid.fillBlock(spacing, spacing, spacing, 1.0 - spacing, 1.0 - spacing, 0.6 - spacing);
 
 // ─────────────────────────────────────────────────────────────
 //  Canvas / overlay
@@ -58,7 +58,10 @@ const handState = {
 // (math.js の各関数は out 引数を取らないと新規確保する)。呼び出し側は結果を
 // 同じ呼び出しの中で同期的に読むだけで、保持はしない。
 const _camView = new Float32Array(16), _camProj = new Float32Array(16), _camViewProj = new Float32Array(16);
-const _camCv = { eye: new Float32Array(3), right: new Float32Array(3), up: new Float32Array(3) };
+const _camCv = {
+    eye: new Float32Array(3), right: new Float32Array(3), up: new Float32Array(3),
+    forward: new Float32Array(3), // shade パスの環境マップサンプル (viewToWorldDir) 用
+};
 const _camFrame = { cv: _camCv, fovY: 0, view: _camView, proj: _camProj, viewProj: _camViewProj };
 const WORLD_UP = [0, 1, 0];
 function computeCameraFrame(aspect) {
@@ -286,7 +289,7 @@ function showError(err) {
 window.addEventListener('error', (e) => showError(e.error || e.message));
 window.addEventListener('unhandledrejection', (e) => showError(e.reason));
 
-function init() {
+async function init() {
     const gl = getGL2(c);
     fluid.initGL(gl);
     renderer = new NRFRenderer(gl, fluid);
@@ -297,12 +300,13 @@ function init() {
     }
     resizeCanvases();
     window.addEventListener('resize', resizeCanvases);
+    // 背景・反射・屈折用の環境マップ。ループ開始前に読み終える (起動が数百msブロックされる
+    // だけなので、真っ黒な初期フレームを許容するより単純)。
+    renderer.envTex = await loadEquirectTexture(gl, 'textures/suburban_garden_equirect.png');
     startLoop();
 }
 
-try {
-    init();
-} catch (err) {
+init().catch((err) => {
     if (err instanceof GLCapabilityError) showError(err);
     else throw err;
-}
+});

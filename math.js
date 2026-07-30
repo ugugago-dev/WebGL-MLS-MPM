@@ -47,9 +47,11 @@ export function mat4Multiply(a, b, out = new Float32Array(16)) {
     return out;
 }
 
-// `out` is an optional caller-owned { eye:[x,y,z], right:[x,y,z], up:[x,y,z] } to
-// write into instead of allocating fresh arrays/object — same reuse pattern as the
+// `out` is an optional caller-owned { eye:[x,y,z], right:[x,y,z], up:[x,y,z], forward:[x,y,z] }
+// to write into instead of allocating fresh arrays/object — same reuse pattern as the
 // mat4* functions above. Defaults to a fresh allocation for existing call sites.
+// `forward` is optional on `out` (only written if present) so existing callers that pass
+// an { eye, right, up } literal without a forward field keep working unchanged.
 export function cameraVectors(cam, out = { eye: [0, 0, 0], right: [0, 0, 0], up: [0, 0, 0] }) {
     const cp = Math.cos(cam.phi), sp = Math.sin(cam.phi), ct = Math.cos(cam.theta), st = Math.sin(cam.theta);
     const dx = cp * st, dy = sp, dz = cp * ct;
@@ -63,6 +65,7 @@ export function cameraVectors(cam, out = { eye: [0, 0, 0], right: [0, 0, 0], up:
     const ux = ry * fz - rz * fy, uy = rz * fx - rx * fz, uz = rx * fy - ry * fx;
     out.right[0] = rx; out.right[1] = ry; out.right[2] = rz;
     out.up[0] = ux; out.up[1] = uy; out.up[2] = uz;
+    if (out.forward) { out.forward[0] = fx; out.forward[1] = fy; out.forward[2] = fz; }
     return out;
 }
 

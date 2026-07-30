@@ -186,6 +186,26 @@ export function makeDepthRenderbuffer(gl, w, h) {
     return rb;
 }
 
+// equirectangular環境マップ (PNG) を2Dテクスチャとして読み込む。ミップマップ無し・LINEAR、
+// 横方向(経度)はシームで繋がるようREPEAT、縦方向(緯度)は極で折り返さないようCLAMP_TO_EDGE。
+// UNPACK_FLIP_Y_WEBGLは既定値(false)のまま — PNGの先頭行(パノラマの上端=空)がそのまま
+// テクスチャの先頭行になり、シェーダ側のequirectUV()はv=0が空になるよう書いてある
+// (nrf-shaders.js SHADE_FS 参照)。
+export async function loadEquirectTexture(gl, url) {
+    const res = await fetch(url);
+    const bitmap = await createImageBitmap(await res.blob());
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB8, gl.RGB, gl.UNSIGNED_BYTE, bitmap);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    bitmap.close();
+    return tex;
+}
+
 // デバッグ用: 直近の GL エラーを投げる。ホットパスでは呼ばないこと
 // (getError は GPU との同期を強制する)。
 export function assertNoGLError(gl, where) {

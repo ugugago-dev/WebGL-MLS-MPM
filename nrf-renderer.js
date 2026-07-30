@@ -7,8 +7,9 @@ import {
 
 // WebGPU版 fluid-renderer.js のNRF (Narrow-Range Filter) 表面レンダリングを移植した
 // ParticleRenderer の後継。壁のデバッグ描画・spray/foam(diffuse粒子)は Sim_WebGL に
-// 土台が無いため対象外。shade の反射・屈折はWebGPU版と厳密に同じ式・同じ定数値
-// (固定skyColor反射 + 単色背景屈折、詳細は nrf-shaders.js SHADE_FS のコメント参照)。
+// 土台が無いため対象外。shade の背景・反射・屈折は2026-07-30以降WebGPU版から分岐し、
+// equirectangular環境マップ(this.envTex)を方向ベクトルでサンプルする方式
+// (詳細は nrf-shaders.js SHADE_FS のコメント参照)。
 //
 // パス構成 (draw() 内、WebGPU版のPass1/T1/NRF/ThB/shadeに対応):
 //   1. 深度   : 粒子ビルボード → R32F (rawTex) + 実深度テスト                [RENDER_SCALE解像度]
@@ -68,6 +69,7 @@ export class NRFRenderer {
         gl.useProgram(this.progShade);
         gl.uniform1i(this.uShade.uDepthTex, 0);
         gl.uniform1i(this.uShade.uThickTex, 1);
+        gl.uniform1i(this.uShade.uEnvTex, 2);
         gl.useProgram(this.progBlit);
         gl.uniform1i(this.uBlit.uSceneTex, 0);
         gl.useProgram(null);
@@ -92,19 +94,27 @@ export class NRFRenderer {
             { loc: 3, size: 2, buffer: this.cornerBuf, stride: 0, offset: 0, divisor: 0 },
         ]));
 
+        // 背景・反射・屈折に使うequirectangular環境マップ。非同期ロードなので
+        // main.js init() が gl-utils.js loadEquirectTexture() で読み込み次第セットする
+        // (profiler と同じ「外からプロパティを直接差し込む」パターン)。
+        this.envTex = null;
+
         this._w = 0; this._h = 0;
     }
 
     _beginPass(name) { if (this.profiler) this.profiler.begin(name); }
     _endPass() { if (this.profiler) this.profiler.end(); }
 
-    // Pass1(深度)・Pass T1(厚み)の両ビルボードパスが共有するカメラuniformの設定
-    // (uProjだけはPass1限定で呼び出し側が別途設定する — THICK_FSにはuProjが無い)。
+    // Pass1(深度)・Pass T1(厚み)・shadeが共有するカメラuniformの設定 (uProjだけはPass1限定で
+    // 呼び出し側が別途設定する — THICK_FS/SHADE_FSにはuProjが無い)。宛先プログラムに無い
+    // uniform名はuniformLocations()のProxyでnullになり、gl.uniform*(null,...)はno-opなので
+    // (gl-utils.js参照)、uViewProj/uViewを持たないSHADE_FSに対しても安全に呼べる。
     _setBillboardCamera(u, view, viewProj, cv) {
         const gl = this.gl;
         gl.uniformMatrix4fv(u.uViewProj, false, viewProj);
         gl.uniformMatrix4fv(u.uView, false, view);
         gl.uniform3f(u.uCamRight, cv.right[0], cv.right[1], cv.right[2]);
+        gl.uniform3f(u.uCamForward, cv.forward[0], cv.forward[1], cv.forward[2]);
         gl.uniform3f(u.uCamUp, cv.up[0], cv.up[1], cv.up[2]);
     }
 
@@ -254,9 +264,10 @@ export class NRFRenderer {
         // ── shade: 最終深度(filtB) + 最終厚み(thickB) → sceneColorTex (RENDER_SCALE解像度) へ描画 ──
         // viewportはPass1〜4と同じ (sw,sh) のまま変わっていないので再設定不要。
         this._beginPass('5 shade');
-        this._runFullscreen(this.sceneFBO, this.progShade, [this.filtB, this.thickB]);
-        gl.clearColor(0.08, 0.09, 0.11, 1.0);
-        gl.clear(gl.COLOR_BUFFER_BIT);
+        this._runFullscreen(this.sceneFBO, this.progShade, [this.filtB, this.thickB, this.envTex]);
+        // シェーダが全ピクセルを書く(水の有無どちらの分岐でもoColorを出す)ので、
+        // ここでのクリアは不要 — 環境マップ導入前は水の無いピクセルをdiscardしていたため必要だった。
+        this._setBillboardCamera(this.uShade, view, viewProj, cv);
         gl.uniform2f(this.uShade.uScreenRes, sw, sh);
         gl.uniform1f(this.uShade.uTanHalfFovY, tanHalfFovY);
         gl.uniform1f(this.uShade.uAspect, aspect);
