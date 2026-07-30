@@ -86,12 +86,43 @@ function computeCameraFrame(aspect) {
     // 次に上書きされるのは次の rAF フレームなので競合しない。
     const _pmPos = new Float32Array(3);
 
+    // ピンチズーム (2本指)。タッチのみ対象 — マウス/ペンは touches に一切乗らないので
+    // 以下の分岐は素通りし、既存の1本指ロジックがそのまま動く。
+    const touches = new Map(); // touch pointerId → {x, y} (クライアント座標)
+    const pinch = { active: false, startDist: 0, startRadius: 0 };
+    const touchDist = () => {
+        const [a, b] = touches.values();
+        return Math.hypot(a.x - b.x, a.y - b.y);
+    };
+    // 2本目の指が触れた瞬間、直前に1本目の指で始まっていたオービット/押す操作を打ち切る
+    // (ピンチと同時に水を押し続けたり回転し続けたりすると意図しない操作になるため)。
+    const cancelSingleFingerGestures = () => {
+        if (iact.active) {
+            iact.active = false; iact.pointerId = null;
+            handState.active = false; handState.vel[0] = handState.vel[1] = handState.vel[2] = 0;
+        }
+        if (orbit.active) { orbit.active = false; orbit.pointerId = null; }
+    };
+
     overlay.addEventListener('contextmenu', (e) => e.preventDefault());
     // iOS Safari は touch-action に関係なく pinch-zoom の gesture イベントを出すので塞ぐ。
     document.addEventListener('gesturestart', (e) => e.preventDefault());
     document.addEventListener('gesturechange', (e) => e.preventDefault());
 
     overlay.addEventListener('pointerdown', (e) => {
+        if (e.pointerType === 'touch') {
+            touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+            overlay.setPointerCapture(e.pointerId);
+            if (touches.size >= 2) {
+                cancelSingleFingerGestures();
+                pinch.active = true;
+                pinch.startDist = touchDist() || 1;
+                pinch.startRadius = camera.radius;
+                e.preventDefault();
+                return;
+            }
+        }
+
         const aspect = c.width / c.height;
         const { cv, viewProj: vp } = computeCameraFrame(aspect);
 
@@ -123,6 +154,14 @@ function computeCameraFrame(aspect) {
     });
 
     overlay.addEventListener('pointermove', (e) => {
+        if (e.pointerType === 'touch' && touches.has(e.pointerId)) {
+            touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+            if (pinch.active) {
+                const d = touchDist() || 1;
+                camera.radius = Math.max(1, Math.min(100000, pinch.startRadius * (pinch.startDist / d)));
+                return;
+            }
+        }
         if (orbit.active && e.pointerId === orbit.pointerId) {
             const dx = e.clientX - orbit.lastX, dy = e.clientY - orbit.lastY;
             orbit.lastX = e.clientX; orbit.lastY = e.clientY;
@@ -146,6 +185,10 @@ function computeCameraFrame(aspect) {
     });
 
     const endPointer = (e) => {
+        if (e.pointerType === 'touch') {
+            touches.delete(e.pointerId);
+            if (touches.size < 2) pinch.active = false;
+        }
         if (e.pointerId === iact.pointerId) {
             iact.active = false; iact.pointerId = null;
             handState.active = false; handState.vel[0] = handState.vel[1] = handState.vel[2] = 0;
@@ -194,7 +237,7 @@ function drawOverlay(cv, viewProj, frameMs) {
     octx.fillText(`particles: ${fluid.active_particle_num} / ${fluid.particle_num}`, 16, nextY());
     octx.fillText(`grid: ${fluid.grid_X_num}x${fluid.grid_Y_num}x${fluid.grid_Z_num} (${fluid.grid_num} cells)`, 16, nextY());
     octx.fillText(isMobile
-        ? 'drag in sim: push  drag outside: orbit'
+        ? 'drag in sim: push  drag outside: orbit  pinch: zoom'
         : 'L-drag: push fluid  R-drag: orbit  wheel: zoom', 16, nextY());
 
     // ?prof でパス単位の内訳を出す (GPU 時間 = EXT_disjoint_timer_query_webgl2)。
