@@ -243,9 +243,11 @@ function drawOverlay(cv, viewProj, frameMs) {
     // ?prof でパス単位の内訳を出す (GPU 時間 = EXT_disjoint_timer_query_webgl2)。
     if (profiler) {
         ln++;
-        if (!profiler.gpuEnabled) {
+        if (profiler.syncMode) {
+            // 拡張が無い環境 (モバイルはほぼこれ) の gl.finish() 同期計測。順位と比率だけ
+            // 読むこと — 絶対値も fps も同期オーバーヘッドで悪化する (gl-profiler.js 参照)。
             octx.fillStyle = '#f88';
-            octx.fillText('GPU timer 拡張なし — CPU 時間のみ', 16, nextY());
+            octx.fillText('GPU timer拡張なし → gl.finish()同期計測: 比率のみ有効', 16, nextY());
         }
         octx.fillStyle = '#8cf';
         let total = 0;
@@ -257,7 +259,7 @@ function drawOverlay(cv, viewProj, frameMs) {
             const share = total > 0 && !r.name.startsWith('CPU') ? ` (${(r.ms / total * 100).toFixed(0)}%)` : '';
             octx.fillText(`${r.name.padEnd(18)} ${r.ms.toFixed(3)} ms${share}`, 16, nextY());
         }
-        octx.fillText(`${'GPU total'.padEnd(18)} ${total.toFixed(3)} ms`, 16, nextY());
+        octx.fillText(`${(profiler.syncMode ? 'sync total' : 'GPU total').padEnd(18)} ${total.toFixed(3)} ms`, 16, nextY());
         // dropped が増え続けている = 重いパスの結果が回収できていない。表から消えている
         // 項目は「速い」のではなく「測れていない」(gl-profiler.js poll() のコメント参照)。
         if (profiler.dropped > 0) {
@@ -291,6 +293,8 @@ function startLoop() {
         }
         // GPU タイマーに映らないコスト (JS・ドライバの検証・コマンド積み) を切り分けるため
         // CPU 時間も別に測る。GL 呼び出しは非同期なのでこれは「発行にかかった時間」。
+        // ただし profiler が syncMode のときは各パスが gl.finish() で待つので、この値は
+        // 「発行時間」ではなく実質シム全体のGPU時間になる (gl-profiler.js の注意書き参照)。
         if (profiler && simSteps > 0) profiler.cpu('CPU sim submit', performance.now() - tSim);
         // 実フレームコストが SIM_STEP_S*MAX_SIM_STEPS を超え続けると simAccum が
         // 際限なく溜まるので、追いつけなかったぶんは捨てる。
@@ -336,8 +340,10 @@ async function init() {
     const gl = getGL2(c);
     fluid.initGL(gl);
     renderer = new NRFRenderer(gl, fluid);
-    if (urlFlag('prof')) {
-        profiler = new GLProfiler(gl);
+    // ?syncprof は拡張があっても gl.finish() 同期計測を使う (desktop で両方式を
+    // 突き合わせる診断用。モバイルは ?prof だけで自動的にそちらへ落ちる)。
+    if (urlFlag('prof') || urlFlag('syncprof')) {
+        profiler = new GLProfiler(gl, { forceSync: urlFlag('syncprof') });
         fluid.profiler = profiler;
         renderer.profiler = profiler;
     }
