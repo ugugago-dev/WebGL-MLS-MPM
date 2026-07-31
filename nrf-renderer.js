@@ -30,8 +30,8 @@ export class NRFRenderer {
 
         const src = buildNRFShaders({ hardMin: fluid.HARD_MIN });
 
-        this.progDepth = makeProgram(gl, src.BILLBOARD_VS, src.DEPTH_FS, { label: 'nrf depth' });
-        this.progThick = makeProgram(gl, src.BILLBOARD_VS, src.THICK_FS, { label: 'nrf thickness' });
+        this.progDepth = makeProgram(gl, src.BILLBOARD_DEPTH_VS, src.DEPTH_FS, { label: 'nrf depth' });
+        this.progThick = makeProgram(gl, src.BILLBOARD_THICK_VS, src.THICK_FS, { label: 'nrf thickness' });
         this.progNrfH  = makeProgram(gl, src.FULLSCREEN_VS, src.NRF_H_FS, { label: 'nrf filter H' });
         this.progNrfV  = makeProgram(gl, src.FULLSCREEN_VS, src.NRF_V_FS, { label: 'nrf filter V' });
         this.progThickSmoothH = makeProgram(gl, src.FULLSCREEN_VS, src.THICK_SMOOTH_H_FS, { label: 'thick smooth H' });
@@ -163,8 +163,11 @@ export class NRFRenderer {
 
         this.filtA  = tex2d(makeFloatTexture, sw, sh, gl.R32F);
         this.filtB  = tex2d(makeFloatTexture, sw, sh, gl.R32F);
-        this.thickA = tex2d(makeFloatTexture, sw, sh, gl.R16F);
-        this.thickB = tex2d(makeFloatTexture, sw, sh, gl.R16F);
+        // 厚みだけ LINEAR — 厚みブラーがガウシアンをバイリニア2点まとめでサンプルする
+        // (nrf-shaders.js gaussianLinearTaps 参照)。R16F は WebGL2 コアでフィルタ可能。
+        // NRFフィルタと shade はこの2枚も texelFetch で読むので影響を受けない。
+        this.thickA = tex2d(makeFloatTexture, sw, sh, gl.R16F, gl.LINEAR);
+        this.thickB = tex2d(makeFloatTexture, sw, sh, gl.R16F, gl.LINEAR);
         this.nrfFBO_A = fbo([this.filtA, this.thickA]);
         this.nrfFBO_B = fbo([this.filtB, this.thickB]);
         // 厚みブラー用の単一アタッチメントFBO (NRFのMRT FBOと同じテクスチャを指す別FBOオブジェクト)。

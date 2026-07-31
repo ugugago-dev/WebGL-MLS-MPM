@@ -36,7 +36,7 @@ export const NRF_ITERATIONS = urlNum('nrf', 2);
 // ?rs= で診断用に上書き可能 (WebGPU版の同名ノブと同じ流儀)。デスクトップ・モバイル
 // 共通で0.5 (2026-07-31、P2G散布の27→3頂点最適化でモバイル既定を0.35へ下げていたが、
 // ユーザー確認により0.5に戻した)。
-export const RENDER_SCALE = urlNum('rs', 0.5);
+export const RENDER_SCALE = urlNum('rs', 1.0);
 
 const THICK_SMOOTH_SIGMA  = 3.0;
 const THICK_SMOOTH_RADIUS = Math.ceil(2 * THICK_SMOOTH_SIGMA);
@@ -65,7 +65,22 @@ export { BG_DEPTH };
 // gl_VertexID による頂点生成ではなく、3頂点分のコーナーを静的VBO (aCorner, divisor=0)
 // として渡す。WebGL2 の「インスタンス描画には divisor=0 の属性が最低1つ必要」という
 // 制約 (CLAUDE.md 踏んだ落とし穴参照) を、P2G散布の islice と同じ要領で満たす。
-function billboardVS(hardMin) {
+//
+// `forDepth` で出力する varying を切り替える: 球インポスターの視点空間位置復元に要る
+// vCenterView/vEx/vEy と、それに伴う uView*pos の行列積は DEPTH_FS 専用で、THICK_FS は
+// vUV と vSize しか読まない。ドライバによっては FS が読まない varying をリンク時に
+// 刈ってくれるが、保証は無いうえ uView*pos の乗算まで消える保証はもっと無いので、
+// 生成側で明示的に落とす (2 パスとも全粒子ぶん走るホットパスなので効く)。
+function billboardVS(hardMin, forDepth) {
+    const depthOut = forDepth ? `
+out vec3 vCenterView;
+out vec2 vEx;
+out vec2 vEy;
+` : '';
+    const depthAssign = forDepth ? `
+    vCenterView = (uView * vec4(aPos, 1.0)).xyz;
+    vEx = ex; vEy = ey;
+` : '';
     return `#version 300 es
 precision highp float;
 
@@ -82,11 +97,8 @@ uniform float uHalfSize;
 uniform float uRestDensity;
 
 out vec2 vUV;
-out vec3 vCenterView;
 out float vSize;
-out vec2 vEx;
-out vec2 vEy;
-
+${depthOut}
 // G2P の床バネが常時上向き速度を注入するため、床付近の粒子は縦にストレッチして
 // 見える。ストレッチ用速度のY成分だけ床から STRETCH_FLOOR_MIN(=HARD_MIN)〜
 // +STRETCH_FLOOR_FADE の帯でフェードする (WebGPU版 WGSL_FLOOR_STRETCH_FADE と同じ)。
@@ -115,10 +127,8 @@ void main() {
     vec3 world = aPos + (lc.x * uCamRight + lc.y * uCamUp) * effSize;
     gl_Position  = uViewProj * vec4(world, 1.0);
     vUV          = aCorner;
-    vCenterView  = (uView * vec4(aPos, 1.0)).xyz;
     vSize        = effSize;
-    vEx = ex; vEy = ey;
-}
+${depthAssign}}
 `;
 }
 
@@ -222,15 +232,15 @@ void main() {
         float fj = zj < depth - dLow ? depth - MU : zj;
         float fk = zk < depth - dLow ? depth - MU : zk;
 
-        bool pairBg = jBg || kBg;
-        float wj = pairBg ? 0.0 : w;
-        float wk = pairBg ? 0.0 : w;
-        sum  += fj * wj + fk * wk;
-        wsum += wj + wk;
+        // 片方でも背景ならペアごと重み 0 にする (WebGPU版と同じ挙動) — j/k で重みは
+        // 常に同値なので1本の pw で足りる。
+        float pw = (jBg || kBg) ? 0.0 : w;
+        sum  += (fj + fk) * pw;
+        wsum += 2.0 * pw;
 
         float tj = texelFetch(uThickTex, ncJ, 0).r;
         float tk = texelFetch(uThickTex, ncK, 0).r;
-        tsum += tj * wj + tk * wk;
+        tsum += (tj + tk) * pw;
     }
 
     oDepth = sum / wsum;
@@ -239,28 +249,52 @@ void main() {
 `;
 }
 
+// ガウシアン重みを「バイリニア1回で隣接2テクセルぶん」にまとめたタップ列を作る。
+// 重み w_i, w_{i+1} の2テクセルは、オフセット (i*w_i + (i+1)*w_{i+1})/(w_i+w_{i+1}) の
+// 位置を1回リニアサンプルするだけで w_i+w_{i+1} 倍として**厳密に**再現できる
+// (ハードウェアの線形補間がまさにこの重み付き和を返すため — 近似ではない)。
+// radius=6 なら片側 6 タップ → 3 タップ、合計 13 → 7 タップになる。
+function gaussianLinearTaps(sigma, radius) {
+    const w = [];
+    for (let i = 0; i <= radius; i++) w.push(Math.exp(-0.5 * i * i / (sigma * sigma)));
+    const taps = [];   // 中心から片側ぶん (反対側は対称なので同じ offset/weight を使う)
+    for (let i = 1; i <= radius; i += 2) {
+        if (i + 1 <= radius) {
+            const weight = w[i] + w[i + 1];
+            taps.push({ offset: (i * w[i] + (i + 1) * w[i + 1]) / weight, weight });
+        } else {
+            taps.push({ offset: i, weight: w[i] });   // 半径が奇数のときの余り
+        }
+    }
+    return { center: w[0], taps };
+}
+
 // 厚み専用ガウシアンブラー (H/V、固定半径)。NRFのbilateral重みとは独立に、
-// グリッド周波数の厚みムラを均す (WebGPU版 mkThickSmoothShader と同じ)。
+// グリッド周波数の厚みムラを均す (WebGPU版 mkThickSmoothShader と同じ結果)。
+// texelFetch ではなくバイリニアサンプルを使うので、入力テクスチャは LINEAR フィルタで
+// 生成すること (nrf-renderer.js が thickA/thickB を makeFloatTexture(..., gl.LINEAR) で
+// 確保している。R16F は WebGL2 コアでフィルタ可能)。
+// 端の扱いは CLAMP_TO_EDGE のラップ任せ (旧実装の手動 clamp と同じ値になる)。
 function thickSmoothFS(horiz) {
-    const stepDir = horiz ? 'ivec2(i, 0)' : 'ivec2(0, i)';
+    const { center, taps } = gaussianLinearTaps(THICK_SMOOTH_SIGMA, THICK_SMOOTH_RADIUS);
+    const wsum = center + 2 * taps.reduce((a, t) => a + t.weight, 0);
+    const dir = horiz ? 'vec2(texel.x, 0.0)' : 'vec2(0.0, texel.y)';
+    // 変数名に step は使わない (GLSL の組み込み関数 step() を隠してしまう)。
+    const tapLines = taps.map(({ offset, weight }) => {
+        const o = `stepUV * ${glFloat(offset)}`;
+        return `    sum += (texture(uSrcTex, uv - ${o}).r + texture(uSrcTex, uv + ${o}).r) * ${glFloat(weight)};`;
+    }).join('\n');
     return `#version 300 es
 precision highp float;
 uniform sampler2D uSrcTex;
 layout(location = 0) out float oThick;
 void main() {
-    ivec2 sz    = textureSize(uSrcTex, 0);
-    ivec2 coord = ivec2(gl_FragCoord.xy);
-    float sum  = texelFetch(uSrcTex, coord, 0).r;
-    float wsum = 1.0;
-    float isigma2 = 1.0 / (${glFloat(THICK_SMOOTH_SIGMA)} * ${glFloat(THICK_SMOOTH_SIGMA)});
-    for (int i = 1; i <= ${THICK_SMOOTH_RADIUS}; i++) {
-        ivec2 ncJ = clamp(coord - ${stepDir}, ivec2(0), sz - ivec2(1));
-        ivec2 ncK = clamp(coord + ${stepDir}, ivec2(0), sz - ivec2(1));
-        float w = exp(-0.5 * float(i) * float(i) * isigma2);
-        sum  += (texelFetch(uSrcTex, ncJ, 0).r + texelFetch(uSrcTex, ncK, 0).r) * w;
-        wsum += 2.0 * w;
-    }
-    oThick = sum / wsum;
+    vec2 texel  = 1.0 / vec2(textureSize(uSrcTex, 0));
+    vec2 uv     = gl_FragCoord.xy * texel;
+    vec2 stepUV = ${dir};
+    float sum = texture(uSrcTex, uv).r * ${glFloat(center)};
+${tapLines}
+    oThick = sum * ${glFloat(1 / wsum)};   // 重みの総和はコンパイル時に確定するので除算しない
 }
 `;
 }
@@ -445,7 +479,10 @@ void main() {
 export function buildNRFShaders({ hardMin }) {
     return {
         FULLSCREEN_VS,
-        BILLBOARD_VS: billboardVS(hardMin),
+        // 深度パスと厚みパスでビルボードVSを作り分ける (厚み側は球インポスター用の
+        // varying と uView*pos を持たない、billboardVS のコメント参照)。
+        BILLBOARD_DEPTH_VS: billboardVS(hardMin, true),
+        BILLBOARD_THICK_VS: billboardVS(hardMin, false),
         DEPTH_FS,
         THICK_FS,
         NRF_H_FS: nrfFilterFS(true),

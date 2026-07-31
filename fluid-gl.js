@@ -40,7 +40,7 @@ export class FluidGL {
         // ── シミュレーションパラメータ (WebGPU 版から 1:1、DT/SUBSTEPS のみ縮小案) ──
         // sub_dt = DT/SUBSTEPS = 0.3。WebGPU 版の 0.2 より粗いので CFL クランプ到達率が
         // 上がる。暴れる場合は SUBSTEPS を増やすのではなく DT を下げること
-        // (1 substep が GL 7 パスなので substep 追加のコストが WebGPU 版より遥かに高い)。
+        // (1 substep が GL 5 パスなので substep 追加のコストが WebGPU 版より遥かに高い)。
         this.DT           = 0.3;
         this.SUBSTEPS     = 1;
         this.REST_DENSITY = 8.0;
@@ -90,9 +90,9 @@ export class FluidGL {
     // 各軸 [HARD_MIN, dim-HARD_MIN] にクランプする: G2P の hardClampAxis は毎substep
     // この範囲を保証するが、initGL直後の最初のP2G (=1回目のG2Pがまだ走っていない) は
     // fillBlock が置いた生の位置をそのまま読む。呼び出し側の正規化座標(spacing=0.03等)が
-    // 小さいグリッドではHARD_MIN=2セルを下回り得る (例: 34セル×0.03≈1.02<2) ので、
-    // ここでクランプしないとP2G散布のステンシルがグリッド外に出る一時的な状態が生まれる
-    // (P2G_MASS_FS/P2G_MOM_FSのdiscardが安全網として拾うが、そもそも起こさないほうがよい)。
+    // 小さいグリッドではHARD_MIN=2セルを下回り得る (例: 34セル×0.03≈1.02<2)。
+    // **このクランプは gl-shaders.js の不変条件 STENCIL_IN_GRID の片翼**で、全パスが
+    // 27タップの範囲チェックを省く根拠になっている — 外してはいけない。
     fillBlock(x0, y0, z0, x1, y1, z1) {
         const step = 0.5, jitter = 0.05;
         const HM = this.HARD_MIN;
@@ -136,6 +136,13 @@ export class FluidGL {
         gl.bindBuffer(gl.ARRAY_BUFFER, null);
 
         this.jitterBuf = makeBuffer(gl, gl.ARRAY_BUFFER, this.jitter, gl.STATIC_DRAW);
+
+        // CPU 側の初期状態はアップロード後は誰も読まない (以降は GPU 上で TF が回す)。
+        // desktop 既定で state 6.8MB + jitter 1.2MB あるので参照を落として解放する。
+        // **この結果 fillBlock() は initGL() より後には呼べない** (呼ぶ設計にするなら
+        // 解放をやめるか、fillBlock 側で再確保すること)。
+        this.state = null;
+        this.jitter = null;
 
         // P2G 散布のインスタンス描画で使うZスライス番号 0,1,2 (ATTR.islice のコメント参照)。
         this.sliceBuf = makeBuffer(

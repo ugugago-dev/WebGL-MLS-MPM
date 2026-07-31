@@ -107,9 +107,17 @@ const ivec3 GRID = ivec3(${gridX}, ${gridY}, ${gridZ});
 const ivec2 GRID_TEX = ivec2(${gridX}, ${gridY * gridZ});
 
 ivec2 cellTexel(ivec3 c) { return ivec2(c.x, c.z * GRID.y + c.y); }
-bool inGrid(ivec3 c) {
-    return all(greaterThanEqual(c, ivec3(0))) && all(lessThan(c, GRID));
-}
+
+// ── 不変条件: 3×3×3 ステンシルは常にグリッド内 (STENCIL_IN_GRID) ────────────────
+// 粒子位置は G2P の hardClampAxis が毎 substep [HARD_MIN, dim-HARD_MIN] = [2, dim-2] へ
+// 押し込み、初期配置の fillBlock も同じ範囲にクランプしている。したがって
+// cellI = floor(pos) ∈ [2, dim-2] で、ステンシルの範囲 [cellI-1, cellI+1] ⊂ [1, dim-1] は
+// 必ずグリッド内に収まる。**これが全パスから 27 回/頂点の範囲チェックを外せる根拠**
+// (P2G 散布の「隣の Z スライスへ染み出さない」議論と同じ不変条件)。
+// 物理が NaN を出した場合だけ texelFetch が範囲外になるが、WebGL2 の texelFetch は
+// 範囲外で未定義値を返すだけでクラッシュも安全性の問題も起こさない。
+// **この不変条件を崩す変更 (HARD_MIN を 2 未満にする、fillBlock のクランプを外す等) を
+// するなら、範囲チェックを全パスへ戻すこと。**
 `;
 
     // WebGPU 版 WGSL_COMMON から移植した共通部分。
@@ -149,31 +157,27 @@ vec4 cellClipPos(ivec3 c) {
     return vec4(t / vec2(GRID_TEX) * 2.0 - 1.0, 0.0, 1.0);
 }
 
-// Zスライス dz(0..2) から3×3ブロックの基準セル (cellI-1, cellI-1, cz) を組み立てる。
-// czがグリッド外ならfalseを返す (呼び出し側は CULLED を設定して return すること)。
+// Zスライス dz(0..2) から3×3ブロックの基準セル (cellI-1, cellI-1, cellI.z-1+dz) を組み立てる。
 // P2G_MASS_VS/P2G_MOM_VS で共通のロジックなのでここに1箇所だけ書く。
-bool sliceBaseCell(ivec3 cellI, int dz, out ivec3 baseCell) {
-    int cz = cellI.z - 1 + dz;
-    if (cz < 0 || cz >= GRID.z) return false;
-    baseCell = ivec3(cellI.x - 1, cellI.y - 1, cz);
-    return true;
+// cz の範囲チェックは不要 — STENCIL_IN_GRID の保証による。
+ivec3 sliceBaseCell(ivec3 cellI, int dz) {
+    return ivec3(cellI.x - 1, cellI.y - 1, cellI.z - 1 + dz);
 }
 `;
 
     // P2G 散布 (フラグメントシェーダ側のみで使う共通部分。discard はフラグメント
     // シェーダでのみ有効な文なので、VS用の SPLAT_COMMON とは別の文字列に分けてある)。
     const SPLAT_FS_COMMON = `
-// gl_FragCoordから3×3ブロック内の相対位置(dx,dy)を復元し、担当セル外ならdiscardする。
-// P2G_MASS_FS/P2G_MOM_FS で共通 (fillBlockはHARD_MINにクランプ済みなので通常は
-// discardしないが、念のための安全網)。
+// gl_FragCoordから3×3ブロック内の相対位置(dx,dy)を復元する。P2G_MASS_FS/P2G_MOM_FS で共通。
+// 点の大きさは常に 3.0 なので local は必ず [0,2]、さらに baseCell が指す 3×3 は
+// STENCIL_IN_GRID によりグリッド内に収まるので、セル自体の範囲チェックは不要。
+// local の範囲だけは残してある — ラスタライズが 1 テクセルでもずれると vec3 の範囲外
+// 添字 (GLSL では未定義動作) になるため、そこだけは保険で捨てる。
 ivec2 recoverLocalXY(ivec3 baseCell) {
     ivec2 t = ivec2(gl_FragCoord.xy);
-    int dx = t.x - baseCell.x;
-    int dy = t.y - (baseCell.z * GRID.y + baseCell.y);
-    if (dx < 0 || dx > 2 || dy < 0 || dy > 2) discard;
-    ivec3 c = ivec3(baseCell.x + dx, baseCell.y + dy, baseCell.z);
-    if (!inGrid(c)) discard;
-    return ivec2(dx, dy);
+    ivec2 local = ivec2(t.x - baseCell.x, t.y - (baseCell.z * GRID.y + baseCell.y));
+    if (any(lessThan(local, ivec2(0))) || any(greaterThan(local, ivec2(2)))) discard;
+    return local;
 }
 `;
 
@@ -203,8 +207,8 @@ void main() {
     ivec3 cellI; vec3 f, wx, wy, wz;
     cellAndWeights(ipos, cellI, f, wx, wy, wz);
 
-    ivec3 baseCell;
-    if (!sliceBaseCell(cellI, dz, baseCell)) { gl_Position = CULLED; gl_PointSize = 1.0; return; }
+    // STENCIL_IN_GRID により棄却条件が無いので、このVSは完全に分岐なし。
+    ivec3 baseCell = sliceBaseCell(cellI, dz);
 
     vBaseCell  = baseCell;
     vWx = wx; vWy = wy;
@@ -264,13 +268,19 @@ void main() {
     cellAndWeights(ipos, cellI, f, wx, wy, wz);
     ivec3 base = cellI - 1;
 
+    // 範囲チェックは STENCIL_IN_GRID により不要。テクセルのY座標 (cz*GRID.y + cy) も
+    // k/j ループへ巻き上げて、27 回の整数乗算を 3 回に減らしてある。
+    // **重みの掛け算の順序 (wx*wy)*wz は変えないこと** — MLS-MPM は P2G と G2P が
+    // 厳密に同じ重みを使うことに依存しており、wy*wz を先に畳むと丸めが 1ulp ずれ得る
+    // (散布側 P2G_MOM_FS の w も (vWx*vWy)*vWzD の順序)。
     float dens = 0.0;
+    int ty0 = base.z * GRID.y + base.y;
     for (int k = 0; k < 3; k++) {
+        int tyk = ty0 + k * GRID.y;
         for (int j = 0; j < 3; j++) {
+            int ty = tyk + j;
             for (int i = 0; i < 3; i++) {
-                ivec3 c = base + ivec3(i, j, k);
-                if (!inGrid(c)) continue;
-                dens += wx[i] * wy[j] * wz[k] * texelFetch(uMass, cellTexel(c), 0).r;
+                dens += wx[i] * wy[j] * wz[k] * texelFetch(uMass, ivec2(base.x + i, ty), 0).r;
             }
         }
     }
@@ -327,11 +337,12 @@ void main() {
     ivec3 cellI; vec3 f, wx, wy, wz;
     cellAndWeights(ipos, cellI, f, wx, wy, wz);
 
-    ivec3 baseCell;
-    if (!sliceBaseCell(cellI, dz, baseCell) || idensity <= 1e-8) {
+    // 棄却は密度条件のみ (セル範囲は STENCIL_IN_GRID で保証されている)。
+    if (idensity <= 1e-8) {
         gl_Position = CULLED; gl_PointSize = 1.0;
         return;
     }
+    ivec3 baseCell = sliceBaseCell(cellI, dz);
 
     vBaseCell = baseCell;
     vWx = wx; vWy = wy; vWzD = wz[dz];
@@ -477,14 +488,20 @@ void main() {
     vec3 gv = vec3(0.0);
     vec3 B0 = vec3(0.0), B1 = vec3(0.0), B2 = vec3(0.0);
 
+    // PRESSURE_VS と同じ巻き上げ (STENCIL_IN_GRID により範囲チェック不要、テクセルの
+    // Y座標とセル中心相対位置 d の Y/Z 成分をループ外へ)。重みの掛け算の順序
+    // (wx*wy)*wz は P2G 側と一致させたまま変えないこと。
+    int ty0 = base.z * GRID.y + base.y;
     for (int k = 0; k < 3; k++) {
+        int tyk = ty0 + k * GRID.y;
+        float dz = float(base.z + k) - ipos.z + 0.5;
         for (int j = 0; j < 3; j++) {
+            int ty = tyk + j;
+            float dy = float(base.y + j) - ipos.y + 0.5;
             for (int i = 0; i < 3; i++) {
-                ivec3 c = base + ivec3(i, j, k);
-                if (!inGrid(c)) continue;
                 float w = wx[i] * wy[j] * wz[k];
-                vec3 cv = texelFetch(uVel, cellTexel(c), 0).xyz;
-                vec3 d  = vec3(c) - ipos + 0.5;
+                vec3 cv = texelFetch(uVel, ivec2(base.x + i, ty), 0).xyz;
+                vec3 d  = vec3(float(base.x + i) - ipos.x + 0.5, dy, dz);
                 vec3 wv = w * cv;
                 gv += wv;
                 B0 += wv.x * d;

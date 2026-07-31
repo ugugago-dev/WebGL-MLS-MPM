@@ -151,10 +151,13 @@ function makeTexture(gl, w, h, internalFormat, filter) {
     return tex;
 }
 
-// 浮動小数点テクスチャ。フィルタは NEAREST 固定 (グリッドは texelFetch で読むし、
-// 32F は線形フィルタ非対応の実装が多い)。
-export function makeFloatTexture(gl, w, h, internalFormat = gl.RGBA32F) {
-    return makeTexture(gl, w, h, internalFormat, gl.NEAREST);
+// 浮動小数点テクスチャ。既定のフィルタは NEAREST (グリッドも深度も texelFetch で読む。
+// **32F を LINEAR にしてはいけない** — OES_texture_float_linear 非対応の実装が多く、
+// その場合サンプルが黙って黒くなる)。
+// filter に gl.LINEAR を渡せるのは 16F 以下の「WebGL2 コアでフィルタ可能」な
+// フォーマットに限る (厚みブラーが R16F をバイリニア2点まとめでサンプルするため)。
+export function makeFloatTexture(gl, w, h, internalFormat = gl.RGBA32F, filter = gl.NEAREST) {
+    return makeTexture(gl, w, h, internalFormat, filter);
 }
 
 // 正規化8bitカラーテクスチャ (RGBA8、LINEAR フィルタ)。FXAA blit の入力など、
