@@ -36,7 +36,7 @@ export const NRF_ITERATIONS = urlNum('nrf', 2);
 // ?rs= で診断用に上書き可能 (WebGPU版の同名ノブと同じ流儀)。デスクトップ・モバイル
 // 共通で0.5 (2026-07-31、P2G散布の27→3頂点最適化でモバイル既定を0.35へ下げていたが、
 // ユーザー確認により0.5に戻した)。
-export const RENDER_SCALE = urlNum('rs', 1.0);
+export const RENDER_SCALE = urlNum('rs', 0.5);
 
 const THICK_SMOOTH_SIGMA  = 3.0;
 const THICK_SMOOTH_RADIUS = Math.ceil(2 * THICK_SMOOTH_SIGMA);
